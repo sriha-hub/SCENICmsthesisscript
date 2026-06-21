@@ -1,1 +1,279 @@
+###############################
+#   LOAD LIBRARIES
+###############################
+devtools::install_github("jinworks/CellChat") #cellchat installation
+library(Seurat)
+library(SeuratDisk)
+library(SeuratObject)
+library(CellChat)
+library(patchwork)
+library(dplyr)
+###############################
+#   LOAD MAIN DATASET
+###############################
+cat("Loading main dataset...\n")
+seu <- LoadH5Seurat(
+  "/Users/sriharini/Downloads/Manz_cellbender_annotated_rpca_2000_30.h5seurat",
+  assays = "RNA",
+  reductions = c("pca", "umap"),
+  graphs = FALSE,
+  neighbors = FALSE,
+  images = FALSE,
+  misc = FALSE,
+  verbose = FALSE
+)
+###############################
+#   SUBSET BY GENOTYPE + SEX
+###############################
+cat("Subsetting by genotype and sex...\n")
+seu_FCre <- subset(seu, subset = genotype_sex == "F_Cre")
+seu_FKO  <- subset(seu, subset = genotype_sex == "F_KO")
+###############################
+#   ADD CELLTYPE COLUMN 
+###############################
+seu_FCre$celltype <- seu_FCre$predicted.id
+seu_FKO$celltype  <- seu_FKO$predicted.id
+###############################
+#   LOAD & PROCESS STROMAL DATA
+###############################
+cat("\nLoading stromal data...\n")
+file_female <- "~/Downloads/GSM8273260_Young-Female-Stromal_filtered_feature_bc_matrix.h5"
+female_counts <- Read10X_h5(file_female)
+stroma_F <- CreateSeuratObject(counts = female_counts)
+cat("Processing stromal data...\n")
+stroma_F <- NormalizeData(stroma_F)
+stroma_F <- FindVariableFeatures(stroma_F)
+stroma_F <- ScaleData(stroma_F)
+stroma_F <- RunPCA(stroma_F)
+stroma_F <- FindNeighbors(stroma_F, dims = 1:20)
+stroma_F <- FindClusters(stroma_F, resolution = 0.5)
+stroma_F <- RunUMAP(stroma_F, dims = 1:20)
+stroma_F$celltype <- stroma_F$seurat_clusters
+
+cat("Original stroma_F:", ncol(stroma_F), "cells\n")
+length(unique(stroma_F$seurat_clusters))
+table(stroma_F$seurat_clusters)
+###############################
+#   DOWNSAMPLE STROMAL DATA
+###############################
+set.seed(123)
+cells_per_cluster <- 300
+cells_to_keep <- unlist(lapply(unique(stroma_F$seurat_clusters), function(cluster) {
+  # Get all cells in this cluster
+  cluster_cells <- colnames(stroma_F)[stroma_F$seurat_clusters == cluster]
+  # Sampling
+  n_sample <- min(cells_per_cluster, length(cluster_cells))
+  sample(cluster_cells, n_sample)
+}))
+
+stroma_F_sub <- subset(stroma_F, cells = cells_to_keep)
+cat("Downsampled to:", ncol(stroma_F_sub), "cells\n")
+###############################
+#   DEFINE CELLCHAT FUNCTION
+###############################
+run_cellchat <- function(seu_obj, project_name) {
+  cat("  - Extracting data...\n")
+  data.input <- GetAssayData(seu_obj, assay = "RNA", slot = "data")
+  meta <- seu_obj@meta.data
+  
+  cat("  - Creating CellChat object...\n")
+  cellchat <- createCellChat(object = data.input, meta = meta, group.by = "celltype")
+  
+  # Set database (must be done before analysis)
+  cellchat@DB <- CellChatDB.use
+  
+  cat("  - Preprocessing...\n")
+  cellchat <- subsetData(cellchat)
+  cellchat <- identifyOverExpressedGenes(cellchat, thresh.pc = 0.01, thresh.fc = 0.1)
+  cellchat <- identifyOverExpressedInteractions(cellchat)
+  
+  cat("  - Computing communication probabilities...\n")
+  cellchat <- computeCommunProb(cellchat)
+  cellchat <- filterCommunication(cellchat, min.cells = 3)
+  
+  cat("  - Computing pathways...\n")
+  cellchat <- computeCommunProbPathway(cellchat)
+  cellchat <- aggregateNet(cellchat)
+  
+  cellchat@options$project.name <- project_name
+  
+  return(cellchat)
+}
+###############################
+#   LOAD CELLCHAT DATABASE
+###############################
+cat("\nLoading CellChat database...\n")
+CellChatDB <- CellChatDB.mouse  
+showDatabaseCategory(CellChatDB)
+CellChatDB.use <- CellChatDB  # Use full database
+###############################
+cat("\nFixing cluster names...\n")
+# Rename stromal clusters to add "Stroma_" prefix
+stroma_F_sub$celltype <- paste0("Stroma_", stroma_F_sub$seurat_clusters)
+###############################
+#   PROCESS ONE DATASET AT A TIME 
+###############################
+# === F_Cre ===
+cat("\n=== Processing F_Cre ===\n")
+cat("Merging datasets...\n")
+FCre_merged <- merge(seu_FCre, stroma_F_sub)
+# Join layers BEFORE using GetAssayData
+cat("Joining layers...\n")
+FCre_merged <- JoinLayers(FCre_merged)
+saveRDS(FCre_merged, "FCre_merged.rds")
+cat("FCre_merged:", ncol(FCre_merged), "cells\n")
+cat("\nRunning CellChat...\n")
+cellchat.F_Cre <- run_cellchat(FCre_merged, "F_Cre")
+cat("Saving F_Cre results...\n")
+saveRDS(cellchat.F_Cre, "cellchat_F_Cre.rds")
+
+# === F_KO ===
+cat("\n=== Processing F_KO ===\n")
+cat("Merging datasets...\n")
+FKO_merged <- merge(seu_FKO, stroma_F_sub)
+cat("FKO_merged:", ncol(FKO_merged), "cells\n")
+# Join layers BEFORE using GetAssayData
+cat("Joining layers...\n")
+FKO_merged <- JoinLayers(FKO_merged)
+saveRDS(FKO_merged, "FKO_merged.rds")
+cat("Running CellChat...\n")
+cellchat.F_KO <- run_cellchat(FKO_merged, "F_KO")
+cat("Saving F_KO results...\n")
+saveRDS(cellchat.F_KO, "cellchat_F_KO.rds")
+
+
+
+###############################
+# LOAD CellChat OBJECTS
+###############################
+# LOAD LIBRARIES
+library(CellChat)
+library(dplyr)
+library(ggplot2)
+
+#LOAD CELLCHAT OBJECTS
+cellchat.F_Cre <- readRDS("~/Desktop/cellchat female new/cellchat_F_Cre.rds")
+cellchat.F_KO  <- readRDS("~/Desktop/cellchat female new/cellchat_F_KO.rds")
+
+# Merging two objects for comparison
+cellchatFEMALE_merged <- mergeCellChat(list(Cre = cellchat.F_Cre, KO = cellchat.F_KO), 
+                                     add.names = c("Cre", "KO"), #avoiding duplicates
+                                     cell.prefix = TRUE)
+
+# Compare total number of interactions
+compareInteractions(cellchatFEMALE_merged, show.legend = TRUE, group = c(1,2))
+# Compare interaction strength/weights
+compareInteractions(cellchatFEMALE_merged, show.legend = TRUE, group = c(1,2), 
+                    measure = "weight")
+
+
+# Direct comparison of information flow
+gg1 <- rankNet(cellchatFEMALE_merged, mode = "comparison", stacked = T, do.stat = TRUE) #stacked=T shows relative
+gg2 <- rankNet(cellchatFEMALE_merged, mode = "comparison", stacked = F, do.stat = TRUE) #stacked=F shows absolute
+gg1 + gg2
+# Save the rankNet comparison plot
+pdf("Female_RankNet_Comparison.pdf", width = 12, height = 8)
+print(gg1 + gg2)
+dev.off()
+
+# 1. Calculate Stromal→Hema Pathway Changes
+calculate_stromal_hema_pathways <- function(cellchat_obj, sources, targets) {
+  prob_matrix <- cellchat_obj@net$prob ## 3D array: [source x target x pathway]
+  stromal_hema_prob <- prob_matrix[sources, targets, , drop = FALSE]
+  pathway_strength <- apply(stromal_hema_prob, 3, sum, na.rm = TRUE) # Sum across all cell pairs
+  return(data.frame(Pathway = names(pathway_strength), Strength = pathway_strength)) #Column 1 = Pathway names; #Column 2 = Their strengths
+}
+
+cre_stromal_hema <- calculate_stromal_hema_pathways(cellchat.F_Cre, stromal_cells, hema_cells)
+ko_stromal_hema <- calculate_stromal_hema_pathways(cellchat.F_KO, stromal_cells, hema_cells)
+
+stromal_hema_comparison <- cre_stromal_hema %>%
+  rename(Cre_Strength = Strength) %>%
+  left_join(ko_stromal_hema %>% rename(KO_Strength = Strength), by = "Pathway") %>%
+  mutate(
+    Difference = KO_Strength - Cre_Strength,
+    Fold_Change = KO_Strength / Cre_Strength, # Ratio
+    Percent_Change = ((KO_Strength - Cre_Strength) / Cre_Strength) * 100,
+    Direction = ifelse(Difference > 0, "Higher in KO", "Lower in KO")
+  ) %>%
+   arrange(desc(abs(Difference)))
+print("Top 20 changed Female Stromal→Hema pathways:")
+print(head(stromal_hema_comparison, 20))
+write.csv(stromal_hema_comparison, 
+          "~/Desktop/Female_Stromal_to_AllHema_Pathway_Changes.csv", 
+          row.names = FALSE)
+
+
+hsc_diff_female <- calculate_diff_stroma_to_target(
+  cellchat.F_Cre,
+  cellchat.F_KO,
+  stromal_cells,
+  "HSC"
+)
+
+plot_diff_bubble(
+  hsc_diff_female,
+  title = "Female: Differential stromal → HSC signaling"
+)
+
+pdf("Female_Stromal_to_HSC_Differential_Pathways.pdf", width = 8, height = 6)
+print(plot_diff_bubble(
+  hsc_diff_female,
+  "Female: Differential stromal → HSC signaling"
+))
+dev.off()
+
+
+Lymphoid_B_diff_female <- calculate_diff_stroma_to_target(
+  cellchat.F_Cre,
+  cellchat.F_KO,
+  stromal_cells,
+  "Lymphoid B progenitor"
+)
+
+plot_diff_bubble(
+  Lymphoid_B_diff_female,
+  title = "Female: Differential stromal → Lymphoid B progenitor signaling"
+)
+
+pdf("Female_Stromal_to_Lymphoid B progenitor_Differential_Pathways.pdf", width = 8, height = 6)
+print(plot_diff_bubble(
+  Lymphoid_B_diff_female,
+  "Female: Differential stromal → Lymphoid B progenitor signaling"
+))
+dev.off()
+
+###############################
+# STROMAL → HEMATOPOIETIC HEATMAP
+###############################
+#LOAD CELLCHAT OBJECTS
+cellchat.F_Cre <- readRDS("~/Desktop/cellchat female new/cellchat_F_Cre.rds")
+cellchat.F_KO  <- readRDS("~/Desktop/cellchat female new/cellchat_F_KO.rds")
+# Merging two objects for comparison
+cellchatFEMALE_merged <- mergeCellChat(list(Cre = cellchat.F_Cre, KO = cellchat.F_KO), 
+                                       add.names = c("Cre", "KO"), 
+                                       cell.prefix = TRUE)
+# Get all cell types
+all_cells <- levels(cellchatFEMALE_merged@idents)
+
+# Define stromal and hematopoietic groups
+stromal_cells <- all_cells[grepl("^Stroma", all_cells)]
+hema_cells <- all_cells[!grepl("^Stroma", all_cells)
+
+# Create KO − Cre heatmap
+pdf("Female_Stroma_to_Hematopoietic_KO_minus_Cre_heatmap.pdf",
+    width = 9, height = 8)
+
+print(
+  netVisual_heatmap(
+    cellchatFEMALE_merged,
+    sources.use = stromal_cells,
+    targets.use = hema_cells,
+    comparison = c(1,2),
+    color.heatmap = c("Lower in KO" = "#0072B2", "Higher in KO" = "red"),
+    title.name = "Stromal → Hematopoietic signaling (KO − Cre)"
+  )
+)
+
+dev.off()
 
